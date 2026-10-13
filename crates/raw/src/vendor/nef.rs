@@ -10,6 +10,7 @@
 
 use super::{nefc, white_from_data};
 use crate::tiffraw::{Packing, check_image, read_image};
+use crate::unpack::unpack_lsb;
 use crate::{BlackLevel, Cfa, ColorData, Mode, OpcodeLists, RawData, RawError, RawFormat, RawImage, Rect, Result};
 use lightcraft_geom::Orientation;
 use lightcraft_tiff::image::ImageInfo;
@@ -19,6 +20,9 @@ use lightcraft_tiff::{ByteOrder, Ifd, Tiff, makernote};
 const WB_RB_LEVELS: u16 = 0x000c;
 const BLACK_LEVEL: u16 = 0x003d;
 const LINEARIZATION_TABLE: u16 = 0x0096;
+/// Maker note `0x0093` NEFCompression; 10 is "packed 14 bits" (uncompressed).
+const NEF_COMPRESSION: u16 = 0x0093;
+const PACKED_14: u16 = 10;
 const CROP_AREA: u16 = 0x0045;
 /// JPEG XS start of codestream (SOC, `FF10`) followed by its mandatory capabilities marker (CAP, `FF50`).
 const JPEG_XS_START: [u8; 4] = [0xff, 0x10, 0xff, 0x50];
@@ -247,6 +251,38 @@ fn uncompressed(bytes: &[u8], info: &ImageInfo, order: ByteOrder, mn: Option<&ma
     read_image(bytes, &top, order, packing)
 }
 
+/// Uncompressed data some Z bodies label 34713 without a linearization table (Z 6, firmware 2.00, NEFCompression
+/// "packed 14 bits"): 14-bit samples packed LSB first, each row padded to a 16-byte boundary. Read only when the single
+/// strip is exactly that size and the maker note, if it says, agrees; anything else is still refused. Decodes the first
+/// `rows` rows of the `info.height`.
+fn packed14_labelled_compressed(bytes: &[u8], info: &ImageInfo, mn: Option<&makernote::MakerNote>, rows: usize) -> Result<RawData> {
+    let refused = || RawError::Unsupported("Nikon compressed NEF without a linearization table (maker note 0x96)".into());
+    let (w, h) = (info.width as usize, info.height as usize);
+    let says = mn.and_then(|m| m.ifd.u16(NEF_COMPRESSION));
+    if info.bits() != 14 || info.samples_per_pixel != 1 || says.is_some_and(|c| c != PACKED_14) || w == 0 || h == 0 {
+        return Err(refused());
+    }
+    let packed = (w * 14).div_ceil(8);
+    let stride = packed.next_multiple_of(16);
+    let chunks = info.chunks(bytes.len() as u64);
+    let [chunk] = chunks.as_slice() else { return Err(refused()) };
+    if stride.checked_mul(h).and_then(|n| u64::try_from(n).ok()) != Some(chunk.len) {
+        return Err(refused());
+    }
+    check_image(bytes, info)?;
+    let start = usize::try_from(chunk.offset).map_err(|_| RawError::Corrupt("NEF: image data outside the file".into()))?;
+    let n = rows.min(h);
+    let mut out = vec![0u16; w * n];
+    for (y, row) in out.chunks_exact_mut(w).enumerate() {
+        let src = start
+            .checked_add(y * stride)
+            .and_then(|a| bytes.get(a..a.checked_add(packed)?))
+            .ok_or_else(|| RawError::Corrupt("NEF: image data outside the file".into()))?;
+        unpack_lsb(src, 14, row);
+    }
+    Ok(RawData::U16(out))
+}
+
 /// Nikon Huffman-compressed strip (see [`super::nefc`]); the decode table is maker note `0x0096`. Decodes the first
 /// `rows` rows of the `info.height`.
 fn compressed(bytes: &[u8], info: &ImageInfo, mn: Option<&makernote::MakerNote>, rows: usize) -> Result<RawData> {
@@ -257,10 +293,9 @@ fn compressed(bytes: &[u8], info: &ImageInfo, mn: Option<&makernote::MakerNote>,
     if starts_with(&JPEG_XS_START) {
         return Err(RawError::Unsupported(HIGH_EFFICIENCY.into()));
     }
-    // (some Z bodies label uncompressed, row-padded data 34713 without a table: not handled here yet)
-    let table = mn
-        .and_then(|m| Some((m.ifd.bytes(LINEARIZATION_TABLE)?, m.order)))
-        .ok_or_else(|| RawError::Unsupported("Nikon compressed NEF without a linearization table (maker note 0x96)".into()))?;
+    let Some(table) = mn.and_then(|m| Some((m.ifd.bytes(LINEARIZATION_TABLE)?, m.order))) else {
+        return packed14_labelled_compressed(bytes, info, mn, rows);
+    };
     if info.samples_per_pixel != 1 {
         return Err(RawError::Unsupported(format!("Nikon compressed NEF with {} samples per pixel", info.samples_per_pixel)));
     }
@@ -518,6 +553,52 @@ mod tests {
         }
         let bytes = nef(1, 12, vec![packed], w as u32, h as u32, h as u32);
         assert_eq!(crate::decode(&bytes).unwrap().data, RawData::U16(px));
+    }
+
+    /// 14-bit samples as an LSB-first bit stream, each row padded to a 16-byte boundary.
+    fn packed14(px: &[u16], w: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in px.chunks(w) {
+            let (mut acc, mut n, mut bytes) = (0u64, 0u32, Vec::new());
+            for &v in row {
+                acc |= u64::from(v) << n;
+                n += 14;
+                while n >= 8 {
+                    bytes.push(acc as u8);
+                    acc >>= 8;
+                    n -= 8;
+                }
+            }
+            if n > 0 {
+                bytes.push(acc as u8);
+            }
+            bytes.resize(bytes.len().next_multiple_of(16), 0);
+            out.extend(bytes);
+        }
+        out
+    }
+
+    /// Z 6 uncompressed NEFs are labelled 34713 with no linearization table: 14-bit LSB-packed rows, each padded to 16
+    /// bytes. They decode when the strip is exactly that size and the maker note says "packed 14 bits" (or nothing).
+    #[test]
+    fn uncompressed_14_bit_labelled_compressed() {
+        let (w, h) = (10usize, 4usize); // 10 samples = 17.5 bytes, padded to 32 per row
+        let px: Vec<u16> = (0..w * h).map(|i| (1000 + i * 397 % 15000) as u16).collect();
+        let strip = packed14(&px, w);
+        assert_eq!(strip.len(), 32 * h);
+        let r = crate::decode(&nef(34713, 14, vec![strip.clone()], w as u32, h as u32, h as u32)).unwrap();
+        assert_eq!(r.data, RawData::U16(px.clone()));
+        let mut says = IfdBuilder::new();
+        says.set(NEF_COMPRESSION, Value::Short(vec![PACKED_14]));
+        let r = crate::decode(&nef_with_note(34713, 14, vec![strip.clone()], w as u32, h as u32, h as u32, Some(says))).unwrap();
+        assert_eq!(r.data, RawData::U16(px));
+        // The maker note naming another compression, a strip one byte short, or 12-bit samples: still refused.
+        let mut other = IfdBuilder::new();
+        other.set(NEF_COMPRESSION, Value::Short(vec![3]));
+        let refused = |bytes: &[u8]| matches!(crate::decode(bytes), Err(RawError::Unsupported(w)) if w.contains("linearization table"));
+        assert!(refused(&nef_with_note(34713, 14, vec![strip.clone()], w as u32, h as u32, h as u32, Some(other))));
+        assert!(refused(&nef(34713, 14, vec![strip[..strip.len() - 1].to_vec()], w as u32, h as u32, h as u32)));
+        assert!(refused(&nef(34713, 12, vec![strip], w as u32, h as u32, h as u32)));
     }
 
     /// An NRW data block (`"NRW 0104"`, fields from byte 8) with `black` at byte `0x20`, as a maker note.
